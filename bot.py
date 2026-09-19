@@ -1,189 +1,70 @@
-import json
-import os
-import time
+import os, logging, threading
+from flask import Flask
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ConversationHandler, ContextTypes, filters
 
-import telebot
-from telebot import types
+BOT_TOKEN_NUO_BOTFATHER = "ĮKLIJUOK_SAVO_TOKENĄ_ČIA"
+BOT_TOKEN = os.getenv("TOKEN") or os.getenv("BOT_TOKEN") or BOT_TOKEN_NUO_BOTFATHER
+CHANNEL_ID = os.getenv("CHANNEL_ID", "@vilniaus_aukses_turgus")
 
+FOTO, PAVADINIMAS, KATEGORIJA, KAINA, APRASYMAS, VIETA, KONTAKTAS, PATVIRTINIMAS = range(8)
+logging.basicConfig(level=logging.INFO)
+KATEGORIJOS = [["🏠 Namai, buitis","👕 Drabužiai"],["📱 Technika","🚲 Transportas"],["🧸 Vaikams","🌱 Sodas"],["🛠️ Įrankiai","📚 Knygos"],["🎁 Dovanoju","💛 Kita"]]
+laikini_skelbimai = {}
 
-TOKEN = os.getenv("TOKEN")
-if not TOKEN:
-    raise RuntimeError("Nenurodytas TOKEN aplinkos kintamasis.")
-
-bot = telebot.TeleBot(TOKEN)
-DB = "turgus_db.json"
-user_data = {}
-
-
-def load_db():
-    if not os.path.exists(DB):
-        return []
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [[InlineKeyboardButton("➕ Įdėti skelbimą", callback_data="ideti")]]
+    await update.message.reply_text("💛 **VILNIAUS AUKŠĖS TURGUS** 💛\n\nDukrytės Auksės garbei!\n\n/ideti - Įdėti", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+async def ideti_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query
+    if q: await q.answer()
+    context.user_data.clear()
+    await (q.message if q else update.message).reply_text("📸 1/7 - Foto (arba 'neturiu')", reply_markup=ReplyKeyboardRemove())
+    return FOTO
+async def gavo_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['foto']=update.message.photo[-1].file_id if update.message.photo else None
+    await update.message.reply_text("📝 2/7 - Pavadinimas?")
+    return PAVADINIMAS
+async def gavo_pavadinima(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['pavadinimas']=update.message.text
+    kb=[[InlineKeyboardButton(t,callback_data=f"kat_{t}") for t in r] for r in KATEGORIJOS]
+    await update.message.reply_text("📦 3/7 - Kategorija", reply_markup=InlineKeyboardMarkup(kb))
+    return KATEGORIJA
+async def gavo_kategorija(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer(); context.user_data['kategorija']=q.data.replace("kat_","")
+    await q.message.reply_text("💰 4/7 - Kaina")
+    return KAINA
+async def gavo_kaina(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['kaina']=update.message.text; await update.message.reply_text("✍️ 5/7 - Aprašymas"); return APRASYMAS
+async def gavo_aprasyma(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['aprasymas']=update.message.text; await update.message.reply_text("📍 6/7 - Vieta"); return VIETA
+async def gavo_vieta(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['vieta']=update.message.text; await update.message.reply_text("📞 7/7 - Kontaktas"); return KONTAKTAS
+async def gavo_kontakta(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['kontaktas']=update.message.text; d=context.user_data; laikini_skelbimai[update.effective_user.id]=d.copy()
+    txt=f"✅ Peržiūra:\n\n📦 {d['pavadinimas']}\n🏷️ {d['kategorija']}\n💰 {d['kaina']}\n📍 {d['vieta']}\n📞 {d['kontaktas']}\n\n📝 {d['aprasymas']}\n"
+    kb=[[InlineKeyboardButton("✅ TAIP, skelbti!",callback_data="patvirtinti")],[InlineKeyboardButton("❌ Iš naujo",callback_data="ideti")]]
+    if d.get('foto'): await update.message.reply_photo(photo=d['foto'],caption=txt,reply_markup=InlineKeyboardMarkup(kb),parse_mode="Markdown")
+    else: await update.message.reply_text(txt,reply_markup=InlineKeyboardMarkup(kb),parse_mode="Markdown")
+    return PATVIRTINIMAS
+async def patvirtinti_skelbima(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer(); data=laikini_skelbimai.get(q.from_user.id) or context.user_data
+    txt=f"💛 **{data['pavadinimas']}**\n\n🏷️ {data['kategorija']}\n💰 {data['kaina']}\n📍 {data['vieta']}\n📞 {data['kontaktas']}\n\n📝 {data['aprasymas']}\n\n#vilnius #auksesturgus"
     try:
-        with open(DB, "r", encoding="utf-8") as file:
-            data = json.load(file)
-        return data if isinstance(data, list) else []
-    except (OSError, json.JSONDecodeError):
-        return []
-
-
-def save_db(data):
-    with open(DB, "w", encoding="utf-8") as file:
-        json.dump(data, file, ensure_ascii=False, indent=2)
-
-
-def main_keyboard():
-    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    keyboard.row("🔵 PARDUODU", "🟢 PERKU")
-    keyboard.row("🔍 IEŠKAU")
-    keyboard.row("📋 MANO SKELBIMAI", "💰 BALANSAS")
-    return keyboard
-
-
-def format_listing(item):
-    username = item.get("username") or ""
-    return (
-        f"📦 {item.get('pavadinimas', '-') }\n"
-        f"💶 {item.get('kaina', '-')}\n"
-        f"📍 {item.get('vieta', '-')}\n"
-        f"👤 @{username}"
-    )
-
-
-@bot.message_handler(commands=["start"])
-def start(message):
-    user_data.pop(message.chat.id, None)
-    bot.send_message(
-        message.chat.id,
-        "Vilniaus Aukštės turgus – skelbimai 24/7!",
-        reply_markup=main_keyboard(),
-    )
-
-
-@bot.message_handler(func=lambda message: message.text == "🔵 PARDUODU")
-def start_selling(message):
-    user_data[message.chat.id] = {"action": "sell", "step": 1}
-    bot.send_message(message.chat.id, "1/3 Ką parduodi?")
-
-
-@bot.message_handler(func=lambda message: message.text == "🔍 IEŠKAU")
-def start_search(message):
-    user_data[message.chat.id] = {"action": "search"}
-    bot.send_message(message.chat.id, "Ko ieškai?")
-
-
-@bot.message_handler(func=lambda message: message.text == "🟢 PERKU")
-def show_listings(message):
-    listings = load_db()
-    if not listings:
-        bot.send_message(message.chat.id, "Turgus tuščias.", reply_markup=main_keyboard())
-        return
-
-    for item in reversed(listings[-15:]):
-        bot.send_message(message.chat.id, format_listing(item))
-
-
-@bot.message_handler(func=lambda message: message.text == "📋 MANO SKELBIMAI")
-def show_my_listings(message):
-    listings = [
-        item for item in load_db() if item.get("chat_id") == message.chat.id
-    ]
-    if not listings:
-        bot.send_message(message.chat.id, "Skelbimų neturite.")
-        return
-
-    for item in listings:
-        keyboard = types.InlineKeyboardMarkup()
-        keyboard.add(
-            types.InlineKeyboardButton(
-                "🗑️ Ištrinti", callback_data=f"delete_{item['id']}"
-            )
-        )
-        bot.send_message(
-            message.chat.id, format_listing(item), reply_markup=keyboard
-        )
-
-
-@bot.message_handler(func=lambda message: message.text == "💰 BALANSAS")
-def show_balance(message):
-    count = sum(
-        item.get("chat_id") == message.chat.id for item in load_db()
-    )
-    bot.send_message(message.chat.id, f"Jūsų skelbimų: {count}")
-
-
-@bot.message_handler(content_types=["text"])
-def handle_steps(message):
-    if message.chat.id not in user_data:
-        return
-
-    data = user_data[message.chat.id]
-
-    if data["action"] == "search":
-        query = message.text.lower()
-        found = [
-            item
-            for item in load_db()
-            if query in item.get("pavadinimas", "").lower()
-        ]
-        if not found:
-            bot.send_message(
-                message.chat.id,
-                f"Pagal užklausą „{message.text}“ nieko nerasta.",
-                reply_markup=main_keyboard(),
-            )
-        else:
-            for item in found:
-                bot.send_message(message.chat.id, format_listing(item))
-        user_data.pop(message.chat.id, None)
-        return
-
-    if data["action"] != "sell":
-        return
-
-    if data["step"] == 1:
-        data["name"] = message.text
-        data["step"] = 2
-        bot.send_message(message.chat.id, "2/3 Kaina?")
-    elif data["step"] == 2:
-        data["price"] = message.text
-        data["step"] = 3
-        bot.send_message(message.chat.id, "3/3 Vieta Vilniuje?")
-    elif data["step"] == 3:
-        listings = load_db()
-        listings.append(
-            {
-                "id": int(time.time() * 1000),
-                "pavadinimas": data["name"],
-                "kaina": data["price"],
-                "vieta": message.text,
-                "username": message.from_user.username,
-                "chat_id": message.chat.id,
-            }
-        )
-        save_db(listings)
-        bot.send_message(
-            message.chat.id,
-            "✅ Skelbimas įdėtas!",
-            reply_markup=main_keyboard(),
-        )
-        user_data.pop(message.chat.id, None)
-
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("delete_"))
-def delete_listing(call):
-    listing_id = int(call.data.split("_", 1)[1])
-    listings = [item for item in load_db() if item.get("id") != listing_id]
-    save_db(listings)
-    bot.answer_callback_query(call.id, "Skelbimas ištrintas")
-    bot.edit_message_reply_markup(
-        call.message.chat.id, call.message.message_id, reply_markup=None
-    )
-
-
-if __name__ == "__main__":
-    while True:
-        try:
-            bot.infinity_polling(skip_pending=True)
-        except Exception as error:
-            print(f"Boto klaida: {error}")
-            time.sleep(3)
+        if data.get('foto'): await context.bot.send_photo(chat_id=CHANNEL_ID,photo=data['foto'],caption=txt,parse_mode="Markdown")
+        else: await context.bot.send_message(chat_id=CHANNEL_ID,text=txt,parse_mode="Markdown")
+        await q.message.reply_text(f"🚀 Paskelbta į {CHANNEL_ID}!")
+    except Exception as e: await q.message.reply_text(f"❌ {e}")
+    laikini_skelbimai.pop(q.from_user.id,None); context.user_data.clear(); return ConversationHandler.END
+async def taisykles(update: Update, context: ContextTypes.DEFAULT_TYPE): await update.message.reply_text("📜 Taisyklės: viskas nuo adatos iki šaldytuvo! 💛")
+def run_bot():
+    if not BOT_TOKEN or BOT_TOKEN=="ĮKLIJUOK_SAVO_TOKENĄ_ČIA": print("❌ NEĮKLIJAVAI TOKENO!"); return
+    app=Application.builder().token(BOT_TOKEN).build()
+    conv=ConversationHandler(entry_points=[CommandHandler("ideti",ideti_start),CallbackQueryHandler(ideti_start,pattern="^ideti$")],states={FOTO:[MessageHandler(filters.PHOTO|filters.TEXT & ~filters.COMMAND,gavo_foto)],PAVADINIMAS:[MessageHandler(filters.TEXT & ~filters.COMMAND,gavo_pavadinima)],KATEGORIJA:[CallbackQueryHandler(gavo_kategorija,pattern="^kat_")],KAINA:[MessageHandler(filters.TEXT & ~filters.COMMAND,gavo_kaina)],APRASYMAS:[MessageHandler(filters.TEXT & ~filters.COMMAND,gavo_aprasyma)],VIETA:[MessageHandler(filters.TEXT & ~filters.COMMAND,gavo_vieta)],KONTAKTAS:[MessageHandler(filters.TEXT & ~filters.COMMAND,gavo_kontakta)],PATVIRTINIMAS:[CallbackQueryHandler(patvirtinti_skelbima,pattern="^patvirtinti$"),CallbackQueryHandler(ideti_start,pattern="^ideti$")]},fallbacks=[CommandHandler("start",start),CommandHandler("ideti",ideti_start)])
+    app.add_handler(CommandHandler("start",start)); app.add_handler(CommandHandler("taisykles",taisykles)); app.add_handler(conv); app.add_handler(CallbackQueryHandler(patvirtinti_skelbima,pattern="^patvirtinti$")); app.run_polling()
+flask_app=Flask(__name__)
+@flask_app.route('/')
+def home(): return "💛 Aukses Turgus veikia!"
+if __name__=="__main__":
+    threading.Thread(target=run_bot,daemon=True).start()
+    flask_app.run(host="0.0.0.0",port=int(os.environ.get("PORT",10000)))
